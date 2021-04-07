@@ -1,5 +1,10 @@
 /*
  * AT91 Timer/Counter.
+ *
+ * Copyright (c) 2019-2020 KSat e.V. Stuttgart
+ *
+ * This work is licensed under the terms of the GNU GPL, version 2 or, at your
+ * option, any later version. See the COPYING file in the top-level directory.
  */
 
 // Overview of TODOs:
@@ -365,8 +370,6 @@ static uint64_t tc_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     TcState *s = opaque;
 
-    //error_report("at91.tc: read access at 0x%02lx", offset);
-
     switch (offset) {
     case TCC0_START ... TCC0_END:
         return tc_chan_mmio_read(&s->chan[0], offset, size);
@@ -390,7 +393,6 @@ static void tc_mmio_write(void *opaque, hwaddr offset, uint64_t value, unsigned 
 {
     TcState *s = opaque;
 
-    //error_report("at91.tc: write access at 0x%02lx (value: 0x%02lx)", offset, value);
 
     switch (offset) {
     case TCC0_START ... TCC0_END:

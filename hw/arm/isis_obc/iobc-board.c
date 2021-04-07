@@ -3,6 +3,11 @@
  *
  * Main board file for the ISIS iOBC board with AT91-SAM chip.
  * See iobc_init function for connected devices and device setup.
+ *
+ * Copyright (c) 2019-2020 KSat e.V. Stuttgart
+ *
+ * This work is licensed under the terms of the GNU GPL, version 2 or, at your
+ * option, any later version. See the COPYING file in the top-level directory.
  */
 
 #include "qemu/osdep.h"
@@ -49,9 +54,35 @@
 #define SOCKET_PIOC     "/tmp/qemu_at91_pioc"
 #define SOCKET_SDRAMC   "/tmp/qemu_at91_sdramc"
 
+#define ADDR_BOOTMEM    0x00000000
+#define ADDR_SDRAMC     0x20000000
+
+
+#define IOBC_LOADER_NONE    0
+#define IOBC_LOADER_DBG     1
+
+#define IOBC_LOADER         IOBC_LOADER_NONE
+
+
+#if IOBC_LOADER == IOBC_LOADER_DBG
+
+#define IOBC_START_ADDRESS  ADDR_SDRAMC
+
+static const PmcInitState pmc_init_state_sdram = {
+    .reg_ckgr_mor     = 0x00004001,
+    .reg_ckgr_plla    = 0x202a3f01,
+    .reg_ckgr_pllb    = 0x10193f05,
+    .reg_pmc_mckr     = 0x00001302,
+};
+
+#else /* IOBC_LOADER */
+
+#define IOBC_START_ADDRESS  ADDR_BOOTMEM
+
+#endif /* IOBC_LOADER */
 
 static struct arm_boot_info iobc_board_binfo = {
-    .loader_start     = 0x00000000,
+    .loader_start     = IOBC_START_ADDRESS,
     .ram_size         = 0x10000000,
     .nb_cpus          = 1,
 };
@@ -103,6 +134,14 @@ static void iobc_bootmem_remap(void *opaque, at91_bootmem_region target)
 {
     IobcBoardState *s = opaque;
 
+    static const char *memnames[] = {
+        [AT91_BOOTMEM_ROM]      = "ROM",
+        [AT91_BOOTMEM_SRAM0]    = "SRAM0",
+        [AT91_BOOTMEM_EBI_NCS0] = "EBI_NCS0",
+    };
+
+    info_report("at91: remapping bootmem to %s", memnames[target]);
+
     memory_region_transaction_begin();
     memory_region_set_enabled(&s->mem_boot[s->mem_boot_target], false);
     memory_region_set_enabled(&s->mem_boot[target], true);
@@ -134,7 +173,6 @@ static void iobc_init(MachineState *machine)
 {
     MemoryRegion *address_space_mem = get_system_memory();
     IobcBoardState *s = g_new(IobcBoardState, 1);
-    char *firmware_path;
     int i;
 
     s->cpu = ARM_CPU(cpu_create(machine->cpu_type));
@@ -190,9 +228,9 @@ static void iobc_init(MachineState *machine)
     memory_region_init_ram(&s->mem_sdram,  NULL, "iobc.sdram",  0x10000000, &error_fatal);
 
     // bootmem aliases
-    memory_region_init_alias(&s->mem_boot[AT91_BOOTMEM_ROM],   NULL, "iobc.internal.bootmem", &s->mem_rom,   0, 0x100000);
-    memory_region_init_alias(&s->mem_boot[AT91_BOOTMEM_SRAM],  NULL, "iobc.internal.bootmem", &s->mem_sram0, 0, 0x100000);
-    memory_region_init_alias(&s->mem_boot[AT91_BOOTMEM_SDRAM], NULL, "iobc.internal.bootmem", &s->mem_sdram, 0, 0x100000);
+    memory_region_init_alias(&s->mem_boot[AT91_BOOTMEM_ROM], NULL, "iobc.internal.bootmem", &s->mem_rom, 0, 0x100000);
+    memory_region_init_alias(&s->mem_boot[AT91_BOOTMEM_SRAM0], NULL, "iobc.internal.bootmem", &s->mem_sram0, 0, 0x100000);
+    memory_region_init_alias(&s->mem_boot[AT91_BOOTMEM_EBI_NCS0], NULL, "iobc.internal.bootmem", &s->mem_pflash, 0, 0x100000);
 
     // put it all together
     memory_region_add_subregion(address_space_mem, 0x00100000, &s->mem_rom);
@@ -208,9 +246,9 @@ static void iobc_init(MachineState *machine)
     }
     memory_region_transaction_commit();
 
-    // map SDRAM to boot by default
-    memory_region_set_enabled(&s->mem_boot[AT91_BOOTMEM_SDRAM], true);
-    s->mem_boot_target = AT91_BOOTMEM_SDRAM;
+    // by default REMAP = 0, so initial bootmem mapping depends on BMS only
+    s->mem_boot_target = AT91_BMS_INIT ? AT91_BOOTMEM_ROM : AT91_BOOTMEM_EBI_NCS0;
+    memory_region_set_enabled(&s->mem_boot[s->mem_boot_target], true);
 
     // reserved memory, accessing this will abort
     create_reserved_memory_region("iobc.undefined", 0x90000000, 0xF0000000 - 0x90000000);
@@ -393,22 +431,26 @@ static void iobc_init(MachineState *machine)
     create_unimplemented_device("iobc.periph.wdt",     0xFFFFFD40, 0x10);
     create_unimplemented_device("iobc.periph.gpbr",    0xFFFFFD50, 0x10);
 
-    // load firmware
+#if IOBC_LOADER == IOBC_LOADER_DBG
+    char *firmware_path;
+
+    /*
+     * Load firmware directly to SDRAMC.
+     *
+     * Note: This is the "debug" way, i.e. load to SDRAMC and jump to SDRAMC start address.
+     *       This bypasses the bootloader and configures the clock for OBSW, which in debug
+     *       loading on real hardware is done via jlink.
+     */
     if (bios_name) {
         firmware_path = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
 
         if (firmware_path) {
-            // load into nor flash (default program store)
-            if (load_image_mr(firmware_path, &s->mem_pflash) < 0) {
-                error_report("Unable to load %s into pflash", bios_name);
-                exit(1);
-            }
-
-            // nor flash gets copied to sdram at boot, thus we load it directly
             if (load_image_mr(firmware_path, &s->mem_sdram) < 0) {
                 error_report("Unable to load %s into sdram", bios_name);
                 exit(1);
             }
+
+            at91_pmc_set_init_state(AT91_PMC(s->dev_pmc), &pmc_init_state_sdram);
 
             g_free(firmware_path);
         } else {
@@ -418,6 +460,7 @@ static void iobc_init(MachineState *machine)
     } else {
         warn_report("No firmware specified: Use -bios <file> to load firmware");
     }
+#endif
 
     arm_load_kernel(s->cpu, machine, &iobc_board_binfo);
 }
